@@ -47,7 +47,8 @@ LRScheduler:
   name: ViTLRScheduler
   learning_rate: 3e-3
   decay_type: cosine
-  warmup_steps: 10000
+  #warmup_steps: 10000
+  warmup_steps: 1000
 
 Optimizer:
   name: Adan
