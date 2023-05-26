@@ -8,10 +8,10 @@ Implementation adapted from https://github.com/sail-sg/Adan
 
 import math
 
-import paddle
+import torch
 
-from passl.optimizer import Optimizer
-from paddle.optimizer import adam
+from torch.optim import Optimizer
+
 
 class Adan(Optimizer):
     """
@@ -35,13 +35,12 @@ class Adan(Optimizer):
             params,
             lr=1e-3,
             betas=(0.98, 0.92, 0.99),
-            lr_func=None,
             eps=1e-8,
             weight_decay=0.0,
             no_prox=False,
-            grad_clip=None,
-            use_master_param=False
     ):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
             raise ValueError("Invalid epsilon value: {}".format(eps))
         if not 0.0 <= betas[0] < 1.0:
@@ -50,18 +49,35 @@ class Adan(Optimizer):
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
         if not 0.0 <= betas[2] < 1.0:
             raise ValueError("Invalid beta parameter at index 2: {}".format(betas[2]))
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, no_prox=no_prox, grad_clip=grad_clip,use_master_param=use_master_param)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, no_prox=no_prox)
         super(Adan, self).__init__(params, defaults)
 
-    @paddle.no_grad()
+    @torch.no_grad()
+    def restart_opt(self):
+        for group in self.param_groups:
+            group['step'] = 0
+            for p in group['params']:
+                if p.requires_grad:
+                    state = self.state[p]
+                    # State initialization
+
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+                    # Exponential moving average of gradient difference
+                    state['exp_avg_diff'] = torch.zeros_like(p)
+
+    @torch.no_grad()
     def step(self, closure=None):
         """ Performs a single optimization step.
         """
-        for group in self.param_groups:
-            # TODO Make sure if nee
-            if group['grad_clip'] is not None:
-                group['grad_clip'](group['params'])
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
+        for group in self.param_groups:
             beta1, beta2, beta3 = group['betas']
             # assume same step across group now to simplify things
             # per parameter step can be easily support by making it tensor, or pass list into kernel
@@ -69,8 +85,6 @@ class Adan(Optimizer):
                 group['step'] += 1
             else:
                 group['step'] = 1
-
-            lr = self._get_lr(group)
 
             bias_correction1 = 1.0 - beta1 ** group['step']
             bias_correction2 = 1.0 - beta2 ** group['step']
@@ -80,79 +94,78 @@ class Adan(Optimizer):
                 if p.grad is None:
                     continue
                 grad = p.grad
-                if grad.dtype in {paddle.float16, paddle.bfloat16}:
-                    grad = paddle.cast(grad, 'float32')
+
                 state = self.state[p]
                 if len(state) == 0:
-                    state['exp_avg'] = paddle.zeros_like(p)
-                    state['exp_avg_diff'] = paddle.zeros_like(p)
-                    state['exp_avg_sq'] = paddle.zeros_like(p)
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_diff'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
                     state['pre_grad'] = grad.clone()
-                    if group['use_master_param'] and p.dtype in {
-                            paddle.float16, paddle.bfloat16
-                    }:
-                        state['master_param'] = paddle.cast(p, dtype='float32')
-                
-                master_param = p
-                if group['use_master_param'] and p.dtype in {
-                        paddle.float16, paddle.bfloat16
-                }:
-                    master_param = state['master_param']
-                
+
+                exp_avg, exp_avg_sq, exp_avg_diff = state['exp_avg'], state['exp_avg_diff'], state['exp_avg_sq']
+                print("------------------")
+                print(exp_avg)
+                print("------------------")
+                print(exp_avg_sq)
+                print("------------------")
+                print(exp_avg_diff)
+                print("------------------")
                 grad_diff = grad - state['pre_grad']
 
-                state['exp_avg'] = state['exp_avg'] * beta1 + grad*( 1. - beta1)  # m_t
-                state['exp_avg_diff'] = state['exp_avg_diff'] * beta2 + grad_diff* (1. - beta2)  # diff_t (v)
+                exp_avg.lerp_(grad, 1. - beta1)  # m_t
+                exp_avg_diff.lerp_(grad_diff, 1. - beta2)  # diff_t (v)
                 update = grad + beta2 * grad_diff
-                state['exp_avg_sq'] = state['exp_avg_sq'] * beta3
-                state['exp_avg_sq'].add_((1. - beta3)* (update * update))  # n_t
+                exp_avg_sq.mul_(beta3).addcmul_(update, update, value=1. - beta3)  # n_t
 
-                denom = state['exp_avg_sq'].sqrt() /(math.sqrt(bias_correction3) + group['eps'])
-                update = (state['exp_avg'] / bias_correction1 + beta2 * state['exp_avg_diff'] / bias_correction2).divide(denom)
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction3)).add_(group['eps'])
+                update = (exp_avg / bias_correction1 + beta2 * exp_avg_diff / bias_correction2).div_(denom)
                 if group['no_prox']:
-                    master_param = master_param * (1 - lr * group['weight_decay'])
-                    master_param = master_param - (update * lr)
-                    p.copy_(paddle.cast(master_param, p.dtype),False)
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                    p.add_(update, alpha=-group['lr'])
                 else:
-                    master_param = master_param - (update * lr)
-                    master_param = master_param / (1 + lr * group['weight_decay'])
-                    p.copy_(paddle.cast(master_param, p.dtype),False)
-                state['pre_grad'].copy_(grad,False)
+                    p.add_(update, alpha=-group['lr'])
+                    p.data.div_(1 + group['lr'] * group['weight_decay'])
 
+                state['pre_grad'].copy_(grad)
+
+        return loss
 if __name__ == "__main__":
     import numpy as np
     np.random.seed(0)
-    # weight = np.random.randn(10,10).astype("float32")
-    # bias = np.random.randn(10).astype("float32")
-    #  np.savez("./para.npz",weight = weight, bias = bias)
+    linear = torch.nn.Linear(10, 10)
+    linear2 = torch.nn.Linear(10, 10)
+
     npzfile = np.load("./para.npz")
     weight = npzfile['weight']
     bias = npzfile['bias']
-    linear = paddle.nn.Linear(10, 10)
-
-    with paddle.no_grad():
-        linear.weight.set_value(weight)
-        linear.bias.set_value(bias)
-
-    inp = paddle.ones([10,10], dtype="float32")
+    with torch.no_grad():
+        linear.weight.copy_(torch.Tensor(weight))
+        linear.bias.copy_(torch.Tensor(bias))
+        linear2.weight.copy_(torch.Tensor(weight))
+        linear2.bias.copy_(torch.Tensor(bias))
+    inp = torch.ones((10,10))
     out = linear(inp)
-    loss = paddle.mean(out)
+    out = linear2(out)
+    loss = torch.mean(out)
     adan = Adan(lr=0.1,
             params=linear.parameters())
-    loss.backward()
     print(linear.weight)
     print(linear.bias)
-    adan.step()
-    adan.clear_grad()
-    out = linear(inp)
-    loss = paddle.mean(out)
+
     loss.backward()
     adan.step()
-    adan.clear_grad()
+    adan.zero_grad()
     out = linear(inp)
-    loss = paddle.mean(out)
+    out = linear2(out)
+    loss = torch.mean(out)
     loss.backward()
     adan.step()
-    adan.clear_grad()
+    adan.zero_grad()
+    out = linear(inp)
+    out = linear2(out)
+    loss = torch.mean(out)
+    loss.backward()
+    adan.step()
+    adan.zero_grad()
     print(linear.weight)
     print(linear.bias)
